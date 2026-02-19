@@ -3,6 +3,7 @@ from allo.ir.types import float32, int32, bool, index
 import numpy as np
 import scipy.special
 
+#Dimensions of input data, output data, and tiles
 BATCH_SIZE = 4
 CONTEXT_LENGTH = 16
 HIDDEN_SIZE = 64
@@ -16,30 +17,40 @@ OUT_ELEMS = BATCH_SIZE * CONTEXT_LENGTH * NUM_HEADS * HEAD_DIM
 
 BLOCK_T = 4
 
+#Load one small tile from input data.
 def load_tile(global_mem: float32[IN_ELEMS], local_tile: float32[BLOCK_T, HEAD_DIM], b: index, h: index, t_start: index, type_offset: int32):
     for t, d in allo.grid(BLOCK_T, HEAD_DIM):
+        #For certain tile's row: t and tile's line d the address in input data is: B * (T * 3H) + t_global * 3H + (type*H + h*D + d)
         t_global: index = t_start + t
         global_c: index = type_offset * HIDDEN_SIZE + h * HEAD_DIM + d
         idx: index = b * (CONTEXT_LENGTH * THREE_H) + t_global * THREE_H + global_c
         local_tile[t, d] = global_mem[idx]
 
+#Store one small tile that already be calculated into output data.
 def store_tile(global_mem: float32[OUT_ELEMS], local_tile: float32[BLOCK_T, HEAD_DIM], b: index, h: index, t_start: index):
     for t, d in allo.grid(BLOCK_T, HEAD_DIM):
         t_global: index = t_start + t
         idx: index = (((b*CONTEXT_LENGTH + t_global) * NUM_HEADS + h) * HEAD_DIM + d)
         global_mem[idx] = local_tile[t, d]
 
+#Apply FlashAttention on a single tile while revise previous value
 def compute_block_attention(Q_tile: float32[BLOCK_T, HEAD_DIM], K_tile: float32[BLOCK_T, HEAD_DIM], V_tile: float32[BLOCK_T, HEAD_DIM], O_tile: float32[BLOCK_T, HEAD_DIM], m_vec: float32[BLOCK_T], l_vec: float32[BLOCK_T], scale: float32, is_first_block: bool):
     S_tile: float32[BLOCK_T, BLOCK_T] = 0.0
+
+    #1. Matmul: S = Q * K^T
     for i, j in allo.grid(BLOCK_T, BLOCK_T):
         for d in range(HEAD_DIM):
             S_tile[i, j] += Q_tile[i, d] * K_tile[j, d]
-
+    
+    #2. Scale the produce, divide by SQRT(HEAD_DIM)
     for i1, j1 in allo.grid(BLOCK_T, BLOCK_T):
         S_tile[i1, j1] = S_tile[i1, j1] * scale
 
+    #3. Online softmax
     for m in range(BLOCK_T):
         row_max_val: float32 = -1e30
+
+        #Find max value in a row
         for n in range(BLOCK_T):
             if S_tile[m, n] > row_max_val:
                 row_max_val = S_tile[m, n]
@@ -52,7 +63,8 @@ def compute_block_attention(Q_tile: float32[BLOCK_T, HEAD_DIM], K_tile: float32[
             m_new = row_max_val
         else:
             m_new = m_prev
-
+        
+        #Get exponentials for revise the data calculated earlier
         alpha: float32 = 0.0
         if is_first_block:
             alpha = 0.0
@@ -60,11 +72,15 @@ def compute_block_attention(Q_tile: float32[BLOCK_T, HEAD_DIM], K_tile: float32[
             alpha = allo.exp(m_prev - m_new)
         beta: float32 = allo.exp(row_max_val - m_new)
         row_sum_exp: float32 = 0.0
+
+        #sum up the exponentials in current tile, namely the divisor of softmax
         for k in range(BLOCK_T):
             row_sum_exp = row_sum_exp + allo.exp(S_tile[m, k] - row_max_val)
 
+        #revise the divisor of softmax using result calculated from current tile.
         l_new: float32 = (l_vec[m] * alpha) + (row_sum_exp * beta)
 
+        #calculate the divident of softmax for this tile.
         p_val: float32[BLOCK_T] = 0.0
         for z in range(BLOCK_T):
             p_val[z] = allo.exp(S_tile[m, z] - row_max_val)
@@ -78,6 +94,7 @@ def compute_block_attention(Q_tile: float32[BLOCK_T, HEAD_DIM], K_tile: float32[
         m_vec[m] = m_new
         l_vec[m] = l_new
 
+#Load data, iterate over all tiled data, store back
 def compute_engine(input_mem: float32[IN_ELEMS], output_mem: float32[OUT_ELEMS]):
     scale: float32 = 1.0 / D_SQRT
     Q_sram: float32[BLOCK_T, HEAD_DIM]
@@ -88,7 +105,9 @@ def compute_engine(input_mem: float32[IN_ELEMS], output_mem: float32[OUT_ELEMS])
     m_sram: float32[BLOCK_T]
     l_sram: float32[BLOCK_T]
 
+    #Loop over batches and heads
     for b, h in allo.grid(BATCH_SIZE, NUM_HEADS):
+        #Loop over Q matrix
         for tr in range(0, CONTEXT_LENGTH, BLOCK_T):
             load_tile(input_mem, Q_sram, b, h, tr, 0)
             for m in range(BLOCK_T):
@@ -96,11 +115,12 @@ def compute_engine(input_mem: float32[IN_ELEMS], output_mem: float32[OUT_ELEMS])
                 l_sram[m] = 0.0
                 for n in range(HEAD_DIM):
                     O_sram[m, n] = 0.0
-
+            #Loop over K, V matrix
             for tc in range(0, CONTEXT_LENGTH, BLOCK_T):
                 load_tile(input_mem, K_sram, b, h, tc, 1)
                 load_tile(input_mem, V_sram, b, h, tc, 2)
 
+                #Compute attention on the certian tile
                 compute_block_attention(Q_sram, K_sram, V_sram, O_sram, m_sram, l_sram, scale, (tc == 0))
             for i in range(BLOCK_T):
                 inv_l: float32 = 1.0 / (l_sram[i] + 1e-9)
@@ -113,15 +133,17 @@ def compute_engine(input_mem: float32[IN_ELEMS], output_mem: float32[OUT_ELEMS])
 A = np.random.rand(IN_ELEMS).astype(np.float32)
 B = np.zeros((OUT_ELEMS), dtype=np.float32)
 
+#pipeline the tile loading process
 s1 = allo.customize(load_tile)
 s1.pipeline("d")
 s1.pipeline("t")
 
-
+#pipeline the tile storing process
 s2 = allo.customize(store_tile)
 s2.pipeline("d")
 s2.pipeline("t")
 
+#unroll the matmul of Q * K^T by doing 4 multiplex at the same time.
 s3 = allo.customize(compute_block_attention)
 s3.partition(s3.Q_tile, partition_type=0, dim=0)
 s3.partition(s3.K_tile, partition_type=0, dim=0)
@@ -129,6 +151,7 @@ s3.unroll("d")
 s3.unroll("j", factor=4)
 s3.unroll("i", factor=4)
 
+#unroll every calculation loop in online softmax, except the loop to find max value in a row which depend on previous result.
 s3.partition(s3.S_tile, partition_type=0, dim=0)
 s3.partition(s3.O_tile, partition_type=0, dim=0)
 s3.partition(s3.V_tile, partition_type=0, dim=0)
@@ -142,7 +165,7 @@ s3.unroll("l")
 s3.unroll("h")
 s3.unroll("m")
 
-
+#unroll the initial process
 s = allo.customize(compute_engine)
 s.partition(s.O_sram, partition_type=0, dim=0)
 s.partition(s.m_sram, partition_type=0, dim=0)
@@ -152,10 +175,12 @@ s.unroll("m")
 
 s.pipeline("d")
 
+#compose every module to collect their optimization
 s.compose([s1, s2, s3])
 mod = s.build(target="vitis_hls", mode="hw",project="flashattn4.prj")
 mod(A, B)
 
+#using numpy to implement flashattention for reference to confirm the correctness of the allo's flashattention module
 A_reshaped = A.reshape((BATCH_SIZE, CONTEXT_LENGTH, 3, NUM_HEADS, HEAD_DIM))
 
 Q_np = A_reshaped[:, :, 0, :, :]
