@@ -62,15 +62,15 @@ def top(
             elif j == 3:
                 L_K[3].put(val)
 
-        for i, j in dsl.grid(N, K):
-            val = local_V[i*K+j]
-            if i == 0:
+        for m, n in dsl.grid(N, K):
+            val = local_V[m*K+n]
+            if m == 0:
                 L_K[3].put(val)
-            elif i == 1:
+            elif m == 1:
                 L_K[2].put(val)
-            elif i == 2:
+            elif m == 2:
                 L_K[1].put(val)
-            elif i == 3:
+            elif m == 3:
                 L_K[0].put(val)
 
 
@@ -89,15 +89,15 @@ def top(
             elif i == 3:
                 local_Sum[i] = L_S[3].get()
 
-        for i, j in dsl.grid(M, K):
-            if i == 0:
-                local_S[i*K+j]=L_S[0].get()
-            elif i == 1:
-                local_S[i*K+j]=L_S[1].get()
-            elif i == 2:
-                local_S[i*K+j]=L_S[2].get()
-            elif i == 3:
-                local_S[i*K+j]=L_S[3].get()
+        for m, n in dsl.grid(M, K):
+            if m == 0:
+                local_S[m*K+n]=L_S[0].get()
+            elif m == 1:
+                local_S[m*K+n]=L_S[1].get()
+            elif m == 2:
+                local_S[m*K+n]=L_S[2].get()
+            elif m == 3:
+                local_S[m*K+n]=L_S[3].get()
 
         
 
