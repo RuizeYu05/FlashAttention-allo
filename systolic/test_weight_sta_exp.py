@@ -1,3 +1,6 @@
+#Full implementation of systolic flashattention
+#Matrix multiplication is weight stationary
+
 import tempfile
 
 import pytest
@@ -31,7 +34,7 @@ def top(
     fifo_S: Stream[float32, 1024][P0, P1]
     fifo_SD: Stream[float32, 1024][P0, P1]
 
-
+#load Q matrix
     @df.kernel(mapping=[1], args=[Q])
     def offchip_loadQ(local_Q: float32[M*K]):
         for i, j in dsl.grid(M, K):
@@ -45,7 +48,7 @@ def top(
             elif i == 3:
                 L_Q[3].put(val)
 
-
+#first load K and then V matrix
     @df.kernel(mapping=[1], args=[K_m, V])
     def offchip_loadK(local_K: float32[K*N], local_V: float32[N*K]):
         for i, j in dsl.grid(K, N):
@@ -72,7 +75,7 @@ def top(
 
 
 
-
+#store the rowsum and output O matrix
     @df.kernel(mapping=[1], args=[S, Sum])
     def offchip_storeS(local_S: float32[M*N], local_Sum: float32[M]):
 
@@ -106,11 +109,12 @@ def top(
         with allo.meta_if(j == 0 and i == K-1):
             q: float32
             v: float32
+            #load Q matrix into systolic array, since it's weight stationary.
             for m in range(K):
                 q = L_Q[j].get()
                 if m != K-1:
                     fifo_Q[i-1, j].put(q)
-
+            #input K matrix and compute its multiplication with Q, the element will stream through systolic array
             s: float32 = 0
             for k in range(K):
                 a: float32 = L_K[i].get()
@@ -120,14 +124,15 @@ def top(
 
             s = fifo_SD[i,j].get()
             max = fifo_SD[i,j].get()
+            #minus row max to avoid overflow
             s = s - max
             s = allo.exp(s*D)
-
+            #get the sum of its row and output it
             ss: float32 = 0.0
             ss = s + fifo_SD[i,j].get()
 
             L_S[j].put(ss)
-
+            #input V matrix and compute its multiplication with P, the element will stream through systolic array
             for g in range(K):
                 v = L_K[i].get()
                 fifo_K[i,j+1].put(v)
@@ -140,28 +145,30 @@ def top(
                 
         with allo.meta_elif(i == K-1 and j == N-1):
             q: float32
+            #load Q matrix into systolic array, since it's weight stationary.
             for m in range(K):
                 q = L_Q[j].get()
                 if m != K-1:
                     fifo_Q[i-1, j].put(q)
-
+            #input K matrix and compute its multiplication with Q, the element will stream through systolic array
             s: float32 = 0
             a: float32 = 0
             for n in range(K):
                 a = fifo_K[i, j].get()
                 s = a * q
                 fifo_S[i-1, j].put(s)
-
+            
             s = fifo_SD[i,j].get()
             max = fifo_SD[i,j].get()
+            #minus row max to avoid overflow
             s = s - max
             s = allo.exp(s*D)
-
+            #get the sum of its row and output it
             ss: float32 = 0.0
             ss = s + fifo_SD[i,j].get()
 
-            L_S[j].put(ss)
-
+            L_S[j].put(ss)  
+            #input V matrix and compute its multiplication with P, the element will stream through systolic array
             for g in range(K):
                 v = fifo_K[i,j].get()
                 ss = fifo_SD[i,j].get()
@@ -173,6 +180,7 @@ def top(
         #bottom two    
         with allo.meta_elif(i == K-1):
             q: float32
+            #load Q matrix into systolic array, since it's weight stationary.
             for m in range(K):
                 q = L_Q[j].get()
                 if m != K-1:
@@ -180,6 +188,7 @@ def top(
             
             s: float32 = 0
             a: float32 = 0
+            #input K matrix and compute its multiplication with Q, the element will stream through systolic array
             for n in range(K):
                 a = fifo_K[i, j].get()
                 s = a * q
@@ -188,14 +197,15 @@ def top(
 
             s = fifo_SD[i,j].get()
             max = fifo_SD[i,j].get()
+            #minus row max to avoid overflow
             s = s - max
             s = allo.exp(s*D)
-
+            #get the sum of its row and output it
             ss: float32 = 0.0
             ss = s + fifo_SD[i,j].get()
 
             L_S[j].put(ss)
-
+            #input V matrix and compute its multiplication with P, the element will stream through systolic array
             for g in range(K):
                 v = fifo_K[i, j].get()
                 fifo_K[i,j+1].put(v)
@@ -211,22 +221,26 @@ def top(
             v: float32
             ss: float32 = 0
             max: float32 = -128
+            #load Q matrix into systolic array, since it's weight stationary.
             q = fifo_Q[i,j].get()
+            #input K matrix and compute its multiplication with Q, the element will stream through systolic array
             for m in range(K):
                 a = L_K[i].get()
                 fifo_K[i,j+1].put(a)
                 s = fifo_S[i,j].get()
                 s = s + a * q
+                #the top row will act as a comparator and compute the row's max value on the fly
                 if s > max:
                     max = s
                 if K-i-m-1>0:
                     fifo_SD[i+1,j].put(s)
+            #minus row max to avoid overflow
             s = s - max
             fifo_SD[i+1,j].put(max)
             s = allo.exp(s*D)
 
             fifo_SD[i+1,j].put(s)
-
+            #input V matrix and compute its multiplication with P, the element will stream through systolic array
             for g in range(K):
                 v = L_K[i].get()
                 fifo_K[i,j+1].put(v)
@@ -238,21 +252,25 @@ def top(
             q: float32 = 0
             s: float32 = 0
             max: float32 = -128
+            #load Q matrix into systolic array, since it's weight stationary.
             q = fifo_Q[i,j].get()
+            #input K matrix and compute its multiplication with Q, the element will stream through systolic array
             for m in range(K):
                 a = fifo_K[i,j].get()
                 s = fifo_S[i,j].get()
                 s = s + a * q
+                #the top row will act as a comparator and compute the row's max value on the fly
                 if s > max:
                     max = s
                 if K-i-m-1>0:
                     fifo_SD[i+1,j].put(s) #keep one s
-
+            #minus row max to avoid overflow
             s = s-max
             fifo_SD[i+1,j].put(max)
             s = allo.exp(s*D)
-
+            
             fifo_SD[i+1,j].put(s)
+            #input V matrix and compute its multiplication with P, the element will stream through systolic array
             for g in range(K):
                 v = fifo_K[i,j].get()
                 ss = v * s
@@ -265,23 +283,26 @@ def top(
             q: float32 = 0
             s: float32 = 0
             max: float32 = -128
+            #load Q matrix into systolic array, since it's weight stationary.
             q = fifo_Q[i,j].get()
+            #input K matrix and compute its multiplication with Q, the element will stream through systolic array
             for m in range(K):
                 a = fifo_K[i,j].get()
                 fifo_K[i,j+1].put(a)
                 s = fifo_S[i,j].get()
                 s = s + a * q
+                #the top row will act as a comparator and compute the row's max value on the fly
                 if s > max:
                     max = s
                 if K-i-m-1>0:
                     fifo_SD[i+1,j].put(s)
-
+            #minus row max to avoid overflow
             s = s - max
             fifo_SD[i+1,j].put(max)
             s = allo.exp(s*D)
 
             fifo_SD[i+1,j].put(s)
-
+            #input V matrix and compute its multiplication with P, the element will stream through systolic array
             for g in range(K):
                 v = fifo_K[i,j].get()
                 fifo_K[i,j+1].put(v)
@@ -292,11 +313,12 @@ def top(
         with allo.meta_elif(j == 0):
             q: float32 = 0
             s: float32 = 0
+            #load Q matrix into systolic array, since it's weight stationary.
             for m in range(i+1):
                 q = fifo_Q[i,j].get()
                 if i-m>0:
                     fifo_Q[i-1, j].put(q)
-            
+            #input K matrix and compute its multiplication with Q, the element will stream through systolic array
             for n in range(K):
                 a = L_K[i].get()
                 fifo_K[i,j+1].put(a)
@@ -312,6 +334,7 @@ def top(
                     fifo_SD[i+1, j].put(s)
                     
             max = fifo_SD[i,j].get()
+            #minus row max to avoid overflow
             s = s - max
             fifo_SD[i+1,j].put(max)
             s = allo.exp(s*D)
@@ -319,7 +342,7 @@ def top(
             ss: float32 = 0.0
             ss = s + fifo_SD[i,j].get()
             fifo_SD[i+1,j].put(ss)
-
+            #input V matrix and compute its multiplication with P, the element will stream through systolic array
             for g in range(K):
                 v = L_K[i].get()
                 fifo_K[i,j+1].put(v)
@@ -335,11 +358,12 @@ def top(
         with allo.meta_elif(j == P1-1):
             q: float32 = 0
             s: float32 = 0
+            #load Q matrix into systolic array, since it's weight stationary.
             for m in range(i+1):
                 q = fifo_Q[i,j].get()
                 if i-m>0:
                     fifo_Q[i-1, j].put(q)
-
+            #input K matrix and compute its multiplication with Q, the element will stream through systolic array
             for n in range(K):
                 a = fifo_K[i,j].get()
                 s = fifo_S[i,j].get()
@@ -353,6 +377,7 @@ def top(
                 if K-i-l-1>0:
                     fifo_SD[i+1, j].put(s)
             max = fifo_SD[i,j].get()
+            #minus row max to avoid overflow
             s = s - max
             fifo_SD[i+1,j].put(max)
             s = allo.exp(s*D)
@@ -360,7 +385,7 @@ def top(
             ss: float32 = 0.0
             ss = s + fifo_SD[i,j].get()
             fifo_SD[i+1,j].put(ss)
-
+            #input V matrix and compute its multiplication with P, the element will stream through systolic array
             for g in range(K):
                 v = fifo_K[i,j].get()
                 ss = fifo_SD[i,j].get()
@@ -372,11 +397,12 @@ def top(
         with allo.meta_else():
             q: float32 = 0
             s: float32 = 0
+            #load Q matrix into systolic array, since it's weight stationary.
             for m in range(i+1):
                 q = fifo_Q[i,j].get()
                 if i-m>0:
                     fifo_Q[i-1, j].put(q)
-
+            #input K matrix and compute its multiplication with Q, the element will stream through systolic array
             for n in range(K):
                 a = fifo_K[i,j].get()
                 fifo_K[i,j+1].put(a)
@@ -392,6 +418,7 @@ def top(
                     fifo_SD[i+1, j].put(s)
 
             max = fifo_SD[i,j].get()
+            #minus row max to avoid overflow
             s = s - max
             fifo_SD[i+1,j].put(max)
             s = allo.exp(s*D)
@@ -399,7 +426,7 @@ def top(
             ss: float32 = 0.0
             ss = s + fifo_SD[i,j].get()
             fifo_SD[i+1,j].put(ss)
-
+            #input V matrix and compute its multiplication with P, the element will stream through systolic array
             for g in range(K):
                 v = fifo_K[i,j].get()
                 fifo_K[i,j+1].put(v)
