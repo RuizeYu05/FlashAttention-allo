@@ -570,15 +570,12 @@ def test_large_scale_gemm():
         )
 
         for tc in range(0, SEQ_LEN, BLOCK_T):
-            print(f"   => 正在向脉动阵列喂入 K, V 的第 {tc//BLOCK_T + 1} 个 Tile...")
             is_first_val = 1 if tc == 0 else 0
             is_first_block = np.array([is_first_val], dtype=np.int32)
 
-            # 切片当前需要的 K 和 V
             K_tile = K_full[tc:tc+BLOCK_T, :]
             V_tile = V_full[tc:tc+BLOCK_T, :]
 
-            # 执行硬件，状态会在 O_hw_state, Sum_hw_state, Max_hw_state 里就地更新
             modhw(
                 Q_tile.flatten(),
                 K_tile.flatten(),
@@ -589,18 +586,12 @@ def test_large_scale_gemm():
                 Max_hw_state.flatten(),
             )
 
-        print("✅ 硬件计算完毕，正在对比结果...")
+        print("Hardware computation finished!!!")
 
-        # 6. 因为我们只喂了 Q 的第一个 Tile，所以只需和 Golden 的前 BLOCK_T 行比对
-        # FlashAttention 别忘了最后要除以 Sum (如果硬件里没做的话)
         O_hw_final = O_hw_state / Sum_hw_state.reshape(BLOCK_T, 1)
 
-        try:
-            np.testing.assert_allclose(O_hw_final, O_golden[0:BLOCK_T, :], atol=1e-3)
-            print("🎉 恭喜！！！4x4 脉动阵列 Tiled FlashAttention 测试完美通过！")
-        except AssertionError as e:
-            print("❌ 对比失败！请检查 hw_emu 的数据流逻辑或 FIFO 是否死锁。")
-            print(e)
+        np.testing.assert_allclose(O_hw_final, O_golden[0:BLOCK_T, :], atol=1e-3)
+        print("Tiling test pass!!!")
 
 if __name__ == "__main__":
     test_large_scale_gemm()
