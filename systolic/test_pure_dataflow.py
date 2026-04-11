@@ -49,6 +49,8 @@ def top(
     fifo_S: Stream[float32, 1024][P0, P1]
     fifo_SD: Stream[float32, 1024][P0, P1]
 
+    sync_token: Stream[int32, 16][1]
+
     @df.kernel(mapping=[1], args=[input_mem])
     def load_tile(input_d: float32[IN_ELEMS]):
         for b, h in allo.grid(BATCH_SIZE, NUM_HEADS):
@@ -63,6 +65,7 @@ def top(
                     elif t == 2: L_Q[2].put(val)
                     elif t == 3: L_Q[3].put(val)
                 for tc in range(0, CONTEXT_LENGTH, BLOCK_T):
+
                     for t, d in allo.grid(BLOCK_T, HEAD_DIM):
                         t_global = tc + t
                         global_c = 1 * HIDDEN_SIZE + h * HEAD_DIM + d
@@ -73,15 +76,22 @@ def top(
                         elif d == 2: L_K[2].put(val)
                         elif d == 3: L_K[3].put(val)
 
+                    
+                    local_V_buf: float32[BLOCK_T, HEAD_DIM]
                     for t, d in allo.grid(BLOCK_T, HEAD_DIM):
                         t_global = tc + t
                         global_c = 2 * HIDDEN_SIZE + h * HEAD_DIM + d
                         idx = b * (CONTEXT_LENGTH * THREE_H) + t_global * THREE_H + global_c
-                        val = input_d[idx]
-                        if t == 3: L_V[0].put(val)
-                        elif t == 2: L_V[1].put(val)
-                        elif t == 1: L_V[2].put(val)
-                        elif t == 0: L_V[3].put(val)
+                        local_V_buf[t, d] = input_d[idx]
+                        
+                    for t_rev in range(BLOCK_T):
+                        for d in range(HEAD_DIM):
+                            t = BLOCK_T - 1 - t_rev
+                            val = local_V_buf[t, d]
+                            if t == 3: L_V[0].put(val)
+                            elif t == 2: L_V[1].put(val)
+                            elif t == 1: L_V[2].put(val)
+                            elif t == 0: L_V[3].put(val)
 
 
     @df.kernel(mapping=[P0, P1], args=[])
@@ -152,18 +162,11 @@ def top(
                             fifo_K[i,j+1].put(v)
                             ss = fifo_SD[i,j].get()
                             ss = ss + s * v
-                            #pre_s = L_O[j].get()
-                            #ss = pre_s * alpha + ss * beta
-
                             L_acc[j].put(ss)
 
-                            #L_O[j].put(ss)
 
                     L_acc[j].put(pre_ss)
                     
-                    #for k in range(BLOCK_T):
-                        #r: float32 = L_O[j].get() / pre_ss
-                        #L_out[j].put(r)
 
 
                 
@@ -230,16 +233,9 @@ def top(
                             ss = fifo_SD[i,j].get()
                             ss = ss + s * v
                             L_acc[j].put(ss)
-                            #pre_s = L_O[j].get()
-                            #ss = pre_s * alpha + ss * beta
-
-                            #L_O[j].put(ss)
 
                     L_acc[j].put(pre_ss)
 
-                    #for k in range(BLOCK_T):
-                        #r: float32 = L_O[j].get() / pre_ss
-                        #L_out[j].put(r)
 
 
         #bottom two    
@@ -309,18 +305,11 @@ def top(
                             fifo_K[i,j+1].put(v)
                             ss = fifo_SD[i,j].get()
                             ss = ss + s * v
-                            #pre_s = L_O[j].get()
-                            #ss = pre_s * alpha + ss * beta
 
                             L_acc[j].put(ss)
 
-                            #L_O[j].put(ss)
 
                     L_acc[j].put(pre_ss)
-
-                    #for k in range(BLOCK_T):
-                        #r: float32 = L_O[j].get() / pre_ss
-                        #L_out[j].put(r)
 
 
         with allo.meta_elif(j == 0 and i == 0):
@@ -614,26 +603,27 @@ def test_tiled_systolic():
     A = np.random.rand(IN_ELEMS).astype(np.float32)
     B = np.zeros((OUT_ELEMS), dtype=np.float32)
 
-
-
     if hls.is_available("vitis_hls"):
-        mod_csyn = df.build(
-            top,
-            target="vitis_hls", 
-            mode="csyn", 
-            project="flash_attention_csyn",
-            wrap_io=True
-        )
-        mod_csyn()
 
-        mod_hw = df.build(
-            top,
-            target="vitis_hls", 
-            mode="hw_emu", 
-            project="flash_attention_hw_emu",
-            wrap_io=True
-        )
-        mod_hw(A, B)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod_csyn = df.build(
+                top,
+                target="vitis_hls", 
+                mode="csyn", 
+                project=tmpdir,
+                wrap_io=True
+            )
+            mod_csyn()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mod_hw = df.build(
+                top,
+                target="vitis_hls", 
+                mode="hw_emu", 
+                project=tmpdir,
+                wrap_io=True
+            )
+            mod_hw(A, B)
 
     A_reshaped = A.reshape((BATCH_SIZE, CONTEXT_LENGTH, 3, NUM_HEADS, HEAD_DIM))
 
