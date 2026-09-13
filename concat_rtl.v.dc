@@ -1,0 +1,260 @@
+## HLS DC synthesis script
+## Generated for stage extract
+
+# change the following to turn off/on timing reporting
+set enable_timing_reporting true
+set compile_seqmap_enable_output_inversion true
+set_host_options -max_cores 1
+
+puts "-- Note: Design Compiler Started"
+
+
+if {[regexp -all {[\s\$]} [file normalize [info script]]] != 0} {
+  puts "Error: Current working directory: \"[info script]\" contains non-standard characters. Please re-run from a different directory."
+  exit 2
+}
+
+set enable_page_mode "false"
+set timing_input_port_default_clock true
+
+if { [file isdirectory "gate_synthesis_dc"] } {
+  puts "Note: Removing old directory gate_synthesis_dc"
+  file delete -force -- "gate_synthesis_dc"
+}
+puts "Note: Creating directory gate_synthesis_dc"
+file mkdir "gate_synthesis_dc"
+cd "gate_synthesis_dc"
+
+set hdlin_while_loop_iterations 1000
+## Set the variable for file path prefixing 
+set RTL_TOOL_SCRIPT_DIR [file dirname [file normalize [info script]]]
+puts "-- RTL_TOOL_SCRIPT_DIR is set to '$RTL_TOOL_SCRIPT_DIR' "
+set MGC_HOME /opt/siemens/catapult/2024.2/Mgc_home
+
+## Initialize DC-HLS variables
+set hls_status 0
+
+proc run_cmd { cmd errstr } {
+  upvar hls_status hls_status
+  puts $cmd
+  set retVal {}
+  if { !$hls_status } {
+    if { [catch { set retVal [uplevel 1 [list eval $cmd] ] } ] } {
+      puts "Error: Unable to $errstr."
+      set hls_status 1
+    }
+  } else {
+    puts "Error: $errstr skipped due to previous errors."
+  }
+  set retVal
+}
+
+# Source custom DesignCompiler script for specified stage
+# stage is one of: initial analyze synthesis reports final terminate
+proc source_custom_script { stage } {
+   global env
+   if { [info exists env(DesignCompiler_CustomScriptDirPath)] } {
+      set dir_path $env(DesignCompiler_CustomScriptDirPath)
+      if { $dir_path ne "" } {
+         set script [file join $dir_path dc_${stage}.tcl]
+         if { [file exists $script] } {
+            set cmd "source $script"
+            set msg [list run custom script $script]
+            uplevel 1 [list run_cmd $cmd $msg]
+         }
+      }
+   }
+}
+
+proc get_slack { reportfile  } {
+  #Return WNS from qor report
+  set slack [expr {1e9}]
+  if {[grep_log "^  Design  WNS" $reportfile  slk]} {
+     if {$slk < $slack} {
+        set slack $slk
+     }
+  }
+  return $slack
+}
+
+proc grep_log {str log var} {
+# First unset return variable, if it exists
+    catch {uplevel 1 unset $var}
+    if {[catch {exec grep $str $log} rsl]} {
+       # No error, just don't set 'var' because calling code
+       # depends on whether var is set 
+       return false
+    }
+    # skip 15 spaces
+    set rsl [string range $rsl 15 end]
+    set rsl [string trim $rsl]
+    if {[llength $rsl] > 1} {
+       set rsl [lindex $rsl 0]
+    }
+    uplevel 1 set $var $rsl
+    return true
+}
+
+
+# Force error for bad link_library
+set_message_info -id UID-3 -stop_on
+
+# Force error for unmapped cells
+set_message_info -id RPT-7 -stop_on
+set_message_info -id LINT-61 -stop_on
+
+# Source potential custom script
+source_custom_script initial
+## Configure technology settings
+set target_library NangateOpenCellLibrary_typical_ccs.db
+set link_library {* NangateOpenCellLibrary_typical_ccs.db dw_foundation.sldb standard.sldb}
+set synthetic_library {dw_foundation.sldb standard.sldb}
+
+## Configure design license usage
+set synlib_dont_get_license {}
+set synlib_wait_for_design_license {}
+
+## Prepare netlist dependencies
+
+## Define library WORK
+if { [file isdirectory "work"] } {
+  file delete -force -- "work"
+}
+puts "Note: Creating directory work"
+file mkdir "work"
+define_design_lib "WORK" -path "work"
+puts "Note: Mapped design library WORK => work"
+run_cmd {analyze -format "verilog" $RTL_TOOL_SCRIPT_DIR/concat_rtl.v} {analyze file 'concat_rtl.v'}
+
+## Elaborate design top 
+run_cmd {elaborate "top"} {elaborate top {}}
+
+set_multi_vth_constraint -reset
+
+
+# Source potential custom script
+source_custom_script analyze
+
+# Use buffers instead of assignment statements in the Verilog netlist,
+# per Design Compiler Reference Methodology recommendations
+set_fix_multiple_port_nets -all -buffer_constants
+
+##  Synthesize toplevel design
+
+## Apply SDC constraints
+read_sdc $RTL_TOOL_SCRIPT_DIR/concat_rtl.v.dc.sdc -version 1.7
+set auto_wire_load_selection false
+
+puts "[clock format [clock seconds] -format {%a %b %d %H:%M:%S %Z %Y}]"
+
+
+# Source potential custom script
+source_custom_script synthesis
+
+set_multi_vth_constraint -reset
+puts "-- Starting synthesis for design 'top'"
+uniquify
+set wait_ctrl_inst [find -hierarchy cell {*_triosy_obj_inst *_synci_inst *_staller_inst *_rsci*_inst}]
+if { [llength $wait_ctrl_inst ] > 0 } {
+  ungroup $wait_ctrl_inst -flatten
+}
+list_libs
+if { [lindex [split $compatibility_version "-"] 1] < "2007.03" } {
+  compile_ultra      
+} else {
+  compile_ultra        
+}
+
+report_qor
+report_power
+report_power -hierarchy -levels 1
+report_wire_load
+# Source potential custom script
+source_custom_script reports
+
+# Will report failure if unmapped cells (since LINT-61 has been marked as a fatal error)
+check_design -unmapped -nosplit
+
+set high_fanout_net_threshold 0
+puts "-- Requested 4 fractional digits for design 'top' timing"
+puts "-- Requested 3 fractional digits for design 'top' capacitance"
+puts "-- Tool output delay factor to nS: 1.0"
+puts "-- ToolID: '${sh_product_version}'"
+puts "-- Characterization mode: p2p "
+
+puts "-- Primary IO Resource IDs: 'v234879_v_d_rsc_0_0 2009 v234879_v_d_rsc_0_1 2010 v234879_v_d_rsc_0_2 2011 v234879_v_d_rsc_0_3 2012 v234879_v_d_rsc_0_4 2013 v234879_v_d_rsc_0_5 2014 v234879_v_d_rsc_0_6 2015 v234879_v_d_rsc_0_7 2016 v234880_v_d_rsc_0_0 2049 v234880_v_d_rsc_0_1 2050 v234880_v_d_rsc_0_2 2051 v234880_v_d_rsc_0_3 2052 v234880_v_d_rsc_0_4 2053 v234880_v_d_rsc_0_5 2054 v234880_v_d_rsc_0_6 2055 v234880_v_d_rsc_0_7 2056 v234880_v_d_rsc_0_8 2057 v234880_v_d_rsc_0_9 2058 v234880_v_d_rsc_0_10 2059 v234880_v_d_rsc_0_11 2060 v234880_v_d_rsc_0_12 2061 v234880_v_d_rsc_0_13 2062 v234880_v_d_rsc_0_14 2063 v234880_v_d_rsc_0_15 2064 v234880_v_d_rsc_0_16 2065 v234880_v_d_rsc_0_17 2066 v234880_v_d_rsc_0_18 2067 v234880_v_d_rsc_0_19 2068 v234880_v_d_rsc_0_20 2069 v234880_v_d_rsc_0_21 2070 v234880_v_d_rsc_0_22 2071 v234880_v_d_rsc_0_23 2072 v234880_v_d_rsc_0_24 2073 v234880_v_d_rsc_0_25 2074 v234880_v_d_rsc_0_26 2075 v234880_v_d_rsc_0_27 2076 v234880_v_d_rsc_0_28 2077 v234880_v_d_rsc_0_29 2078 v234880_v_d_rsc_0_30 2079 v234880_v_d_rsc_0_31 2080 v234881_v_d_rsc_0_0 2113 v234881_v_d_rsc_0_1 2114 v234881_v_d_rsc_0_2 2115 v234881_v_d_rsc_0_3 2116 v234881_v_d_rsc_0_4 2117 v234881_v_d_rsc_0_5 2118 v234881_v_d_rsc_0_6 2119 v234881_v_d_rsc_0_7 2120 v234881_v_d_rsc_0_8 2121 v234881_v_d_rsc_0_9 2122 v234881_v_d_rsc_0_10 2123 v234881_v_d_rsc_0_11 2124 v234881_v_d_rsc_0_12 2125 v234881_v_d_rsc_0_13 2126 v234881_v_d_rsc_0_14 2127 v234881_v_d_rsc_0_15 2128 v234881_v_d_rsc_0_16 2129 v234881_v_d_rsc_0_17 2130 v234881_v_d_rsc_0_18 2131 v234881_v_d_rsc_0_19 2132 v234881_v_d_rsc_0_20 2133 v234881_v_d_rsc_0_21 2134 v234881_v_d_rsc_0_22 2135 v234881_v_d_rsc_0_23 2136 v234881_v_d_rsc_0_24 2137 v234881_v_d_rsc_0_25 2138 v234881_v_d_rsc_0_26 2139 v234881_v_d_rsc_0_27 2140 v234881_v_d_rsc_0_28 2141 v234881_v_d_rsc_0_29 2142 v234881_v_d_rsc_0_30 2143 v234881_v_d_rsc_0_31 2144 v234882_v_d_rsc_0_0 2665 v234882_v_d_rsc_0_1 2666 v234882_v_d_rsc_0_2 2667 v234882_v_d_rsc_0_3 2668 v234882_v_d_rsc_0_4 2669 v234882_v_d_rsc_0_5 2670 v234882_v_d_rsc_0_6 2671 v234882_v_d_rsc_0_7 2672 __MGC__CTRL__ 0'"
+
+puts "-- Synthesis area report for design 'top'"
+report_area -hierarchy -designware -nosplit
+puts "-- END Synthesis area report for design 'top'"
+
+report_resources -hierarchy -nosplit
+
+if { $enable_timing_reporting } {
+   puts "Timing reporting started "
+   set clk_candidates {0 INOUT clk clk 2009 IN v234879_v_d_rsc_0_0_q v234879_v_d_rsc_0_0_q 2010 IN v234879_v_d_rsc_0_1_q v234879_v_d_rsc_0_1_q 2011 IN v234879_v_d_rsc_0_2_q v234879_v_d_rsc_0_2_q 2012 IN v234879_v_d_rsc_0_3_q v234879_v_d_rsc_0_3_q 2013 IN v234879_v_d_rsc_0_4_q v234879_v_d_rsc_0_4_q 2014 IN v234879_v_d_rsc_0_5_q v234879_v_d_rsc_0_5_q 2015 IN v234879_v_d_rsc_0_6_q v234879_v_d_rsc_0_6_q 2016 IN v234879_v_d_rsc_0_7_q v234879_v_d_rsc_0_7_q 2049 IN v234880_v_d_rsc_0_0_q v234880_v_d_rsc_0_0_q 2050 IN v234880_v_d_rsc_0_1_q v234880_v_d_rsc_0_1_q 2051 IN v234880_v_d_rsc_0_2_q v234880_v_d_rsc_0_2_q 2052 IN v234880_v_d_rsc_0_3_q v234880_v_d_rsc_0_3_q 2053 IN v234880_v_d_rsc_0_4_q v234880_v_d_rsc_0_4_q 2054 IN v234880_v_d_rsc_0_5_q v234880_v_d_rsc_0_5_q 2055 IN v234880_v_d_rsc_0_6_q v234880_v_d_rsc_0_6_q 2056 IN v234880_v_d_rsc_0_7_q v234880_v_d_rsc_0_7_q 2057 IN v234880_v_d_rsc_0_8_q v234880_v_d_rsc_0_8_q 2058 IN v234880_v_d_rsc_0_9_q v234880_v_d_rsc_0_9_q 2059 IN v234880_v_d_rsc_0_10_q v234880_v_d_rsc_0_10_q 2060 IN v234880_v_d_rsc_0_11_q v234880_v_d_rsc_0_11_q 2061 IN v234880_v_d_rsc_0_12_q v234880_v_d_rsc_0_12_q 2062 IN v234880_v_d_rsc_0_13_q v234880_v_d_rsc_0_13_q 2063 IN v234880_v_d_rsc_0_14_q v234880_v_d_rsc_0_14_q 2064 IN v234880_v_d_rsc_0_15_q v234880_v_d_rsc_0_15_q 2065 IN v234880_v_d_rsc_0_16_q v234880_v_d_rsc_0_16_q 2066 IN v234880_v_d_rsc_0_17_q v234880_v_d_rsc_0_17_q 2067 IN v234880_v_d_rsc_0_18_q v234880_v_d_rsc_0_18_q 2068 IN v234880_v_d_rsc_0_19_q v234880_v_d_rsc_0_19_q 2069 IN v234880_v_d_rsc_0_20_q v234880_v_d_rsc_0_20_q 2070 IN v234880_v_d_rsc_0_21_q v234880_v_d_rsc_0_21_q 2071 IN v234880_v_d_rsc_0_22_q v234880_v_d_rsc_0_22_q 2072 IN v234880_v_d_rsc_0_23_q v234880_v_d_rsc_0_23_q 2073 IN v234880_v_d_rsc_0_24_q v234880_v_d_rsc_0_24_q 2074 IN v234880_v_d_rsc_0_25_q v234880_v_d_rsc_0_25_q 2075 IN v234880_v_d_rsc_0_26_q v234880_v_d_rsc_0_26_q 2076 IN v234880_v_d_rsc_0_27_q v234880_v_d_rsc_0_27_q 2077 IN v234880_v_d_rsc_0_28_q v234880_v_d_rsc_0_28_q 2078 IN v234880_v_d_rsc_0_29_q v234880_v_d_rsc_0_29_q 2079 IN v234880_v_d_rsc_0_30_q v234880_v_d_rsc_0_30_q 2080 IN v234880_v_d_rsc_0_31_q v234880_v_d_rsc_0_31_q 2113 IN v234881_v_d_rsc_0_0_q v234881_v_d_rsc_0_0_q 2114 IN v234881_v_d_rsc_0_1_q v234881_v_d_rsc_0_1_q 2115 IN v234881_v_d_rsc_0_2_q v234881_v_d_rsc_0_2_q 2116 IN v234881_v_d_rsc_0_3_q v234881_v_d_rsc_0_3_q 2117 IN v234881_v_d_rsc_0_4_q v234881_v_d_rsc_0_4_q 2118 IN v234881_v_d_rsc_0_5_q v234881_v_d_rsc_0_5_q 2119 IN v234881_v_d_rsc_0_6_q v234881_v_d_rsc_0_6_q 2120 IN v234881_v_d_rsc_0_7_q v234881_v_d_rsc_0_7_q 2121 IN v234881_v_d_rsc_0_8_q v234881_v_d_rsc_0_8_q 2122 IN v234881_v_d_rsc_0_9_q v234881_v_d_rsc_0_9_q 2123 IN v234881_v_d_rsc_0_10_q v234881_v_d_rsc_0_10_q 2124 IN v234881_v_d_rsc_0_11_q v234881_v_d_rsc_0_11_q 2125 IN v234881_v_d_rsc_0_12_q v234881_v_d_rsc_0_12_q 2126 IN v234881_v_d_rsc_0_13_q v234881_v_d_rsc_0_13_q 2127 IN v234881_v_d_rsc_0_14_q v234881_v_d_rsc_0_14_q 2128 IN v234881_v_d_rsc_0_15_q v234881_v_d_rsc_0_15_q 2129 IN v234881_v_d_rsc_0_16_q v234881_v_d_rsc_0_16_q 2130 IN v234881_v_d_rsc_0_17_q v234881_v_d_rsc_0_17_q 2131 IN v234881_v_d_rsc_0_18_q v234881_v_d_rsc_0_18_q 2132 IN v234881_v_d_rsc_0_19_q v234881_v_d_rsc_0_19_q 2133 IN v234881_v_d_rsc_0_20_q v234881_v_d_rsc_0_20_q 2134 IN v234881_v_d_rsc_0_21_q v234881_v_d_rsc_0_21_q 2135 IN v234881_v_d_rsc_0_22_q v234881_v_d_rsc_0_22_q 2136 IN v234881_v_d_rsc_0_23_q v234881_v_d_rsc_0_23_q 2137 IN v234881_v_d_rsc_0_24_q v234881_v_d_rsc_0_24_q 2138 IN v234881_v_d_rsc_0_25_q v234881_v_d_rsc_0_25_q 2139 IN v234881_v_d_rsc_0_26_q v234881_v_d_rsc_0_26_q 2140 IN v234881_v_d_rsc_0_27_q v234881_v_d_rsc_0_27_q 2141 IN v234881_v_d_rsc_0_28_q v234881_v_d_rsc_0_28_q 2142 IN v234881_v_d_rsc_0_29_q v234881_v_d_rsc_0_29_q 2143 IN v234881_v_d_rsc_0_30_q v234881_v_d_rsc_0_30_q 2144 IN v234881_v_d_rsc_0_31_q v234881_v_d_rsc_0_31_q} 
+   set i_candidates {2009 IN v234879_v_d_rsc_0_0_q v234879_v_d_rsc_0_0_q 2010 IN v234879_v_d_rsc_0_1_q v234879_v_d_rsc_0_1_q 2011 IN v234879_v_d_rsc_0_2_q v234879_v_d_rsc_0_2_q 2012 IN v234879_v_d_rsc_0_3_q v234879_v_d_rsc_0_3_q 2013 IN v234879_v_d_rsc_0_4_q v234879_v_d_rsc_0_4_q 2014 IN v234879_v_d_rsc_0_5_q v234879_v_d_rsc_0_5_q 2015 IN v234879_v_d_rsc_0_6_q v234879_v_d_rsc_0_6_q 2016 IN v234879_v_d_rsc_0_7_q v234879_v_d_rsc_0_7_q 2049 IN v234880_v_d_rsc_0_0_q v234880_v_d_rsc_0_0_q 2050 IN v234880_v_d_rsc_0_1_q v234880_v_d_rsc_0_1_q 2051 IN v234880_v_d_rsc_0_2_q v234880_v_d_rsc_0_2_q 2052 IN v234880_v_d_rsc_0_3_q v234880_v_d_rsc_0_3_q 2053 IN v234880_v_d_rsc_0_4_q v234880_v_d_rsc_0_4_q 2054 IN v234880_v_d_rsc_0_5_q v234880_v_d_rsc_0_5_q 2055 IN v234880_v_d_rsc_0_6_q v234880_v_d_rsc_0_6_q 2056 IN v234880_v_d_rsc_0_7_q v234880_v_d_rsc_0_7_q 2057 IN v234880_v_d_rsc_0_8_q v234880_v_d_rsc_0_8_q 2058 IN v234880_v_d_rsc_0_9_q v234880_v_d_rsc_0_9_q 2059 IN v234880_v_d_rsc_0_10_q v234880_v_d_rsc_0_10_q 2060 IN v234880_v_d_rsc_0_11_q v234880_v_d_rsc_0_11_q 2061 IN v234880_v_d_rsc_0_12_q v234880_v_d_rsc_0_12_q 2062 IN v234880_v_d_rsc_0_13_q v234880_v_d_rsc_0_13_q 2063 IN v234880_v_d_rsc_0_14_q v234880_v_d_rsc_0_14_q 2064 IN v234880_v_d_rsc_0_15_q v234880_v_d_rsc_0_15_q 2065 IN v234880_v_d_rsc_0_16_q v234880_v_d_rsc_0_16_q 2066 IN v234880_v_d_rsc_0_17_q v234880_v_d_rsc_0_17_q 2067 IN v234880_v_d_rsc_0_18_q v234880_v_d_rsc_0_18_q 2068 IN v234880_v_d_rsc_0_19_q v234880_v_d_rsc_0_19_q 2069 IN v234880_v_d_rsc_0_20_q v234880_v_d_rsc_0_20_q 2070 IN v234880_v_d_rsc_0_21_q v234880_v_d_rsc_0_21_q 2071 IN v234880_v_d_rsc_0_22_q v234880_v_d_rsc_0_22_q 2072 IN v234880_v_d_rsc_0_23_q v234880_v_d_rsc_0_23_q 2073 IN v234880_v_d_rsc_0_24_q v234880_v_d_rsc_0_24_q 2074 IN v234880_v_d_rsc_0_25_q v234880_v_d_rsc_0_25_q 2075 IN v234880_v_d_rsc_0_26_q v234880_v_d_rsc_0_26_q 2076 IN v234880_v_d_rsc_0_27_q v234880_v_d_rsc_0_27_q 2077 IN v234880_v_d_rsc_0_28_q v234880_v_d_rsc_0_28_q 2078 IN v234880_v_d_rsc_0_29_q v234880_v_d_rsc_0_29_q 2079 IN v234880_v_d_rsc_0_30_q v234880_v_d_rsc_0_30_q 2080 IN v234880_v_d_rsc_0_31_q v234880_v_d_rsc_0_31_q 2113 IN v234881_v_d_rsc_0_0_q v234881_v_d_rsc_0_0_q 2114 IN v234881_v_d_rsc_0_1_q v234881_v_d_rsc_0_1_q 2115 IN v234881_v_d_rsc_0_2_q v234881_v_d_rsc_0_2_q 2116 IN v234881_v_d_rsc_0_3_q v234881_v_d_rsc_0_3_q 2117 IN v234881_v_d_rsc_0_4_q v234881_v_d_rsc_0_4_q 2118 IN v234881_v_d_rsc_0_5_q v234881_v_d_rsc_0_5_q 2119 IN v234881_v_d_rsc_0_6_q v234881_v_d_rsc_0_6_q 2120 IN v234881_v_d_rsc_0_7_q v234881_v_d_rsc_0_7_q 2121 IN v234881_v_d_rsc_0_8_q v234881_v_d_rsc_0_8_q 2122 IN v234881_v_d_rsc_0_9_q v234881_v_d_rsc_0_9_q 2123 IN v234881_v_d_rsc_0_10_q v234881_v_d_rsc_0_10_q 2124 IN v234881_v_d_rsc_0_11_q v234881_v_d_rsc_0_11_q 2125 IN v234881_v_d_rsc_0_12_q v234881_v_d_rsc_0_12_q 2126 IN v234881_v_d_rsc_0_13_q v234881_v_d_rsc_0_13_q 2127 IN v234881_v_d_rsc_0_14_q v234881_v_d_rsc_0_14_q 2128 IN v234881_v_d_rsc_0_15_q v234881_v_d_rsc_0_15_q 2129 IN v234881_v_d_rsc_0_16_q v234881_v_d_rsc_0_16_q 2130 IN v234881_v_d_rsc_0_17_q v234881_v_d_rsc_0_17_q 2131 IN v234881_v_d_rsc_0_18_q v234881_v_d_rsc_0_18_q 2132 IN v234881_v_d_rsc_0_19_q v234881_v_d_rsc_0_19_q 2133 IN v234881_v_d_rsc_0_20_q v234881_v_d_rsc_0_20_q 2134 IN v234881_v_d_rsc_0_21_q v234881_v_d_rsc_0_21_q 2135 IN v234881_v_d_rsc_0_22_q v234881_v_d_rsc_0_22_q 2136 IN v234881_v_d_rsc_0_23_q v234881_v_d_rsc_0_23_q 2137 IN v234881_v_d_rsc_0_24_q v234881_v_d_rsc_0_24_q 2138 IN v234881_v_d_rsc_0_25_q v234881_v_d_rsc_0_25_q 2139 IN v234881_v_d_rsc_0_26_q v234881_v_d_rsc_0_26_q 2140 IN v234881_v_d_rsc_0_27_q v234881_v_d_rsc_0_27_q 2141 IN v234881_v_d_rsc_0_28_q v234881_v_d_rsc_0_28_q 2142 IN v234881_v_d_rsc_0_29_q v234881_v_d_rsc_0_29_q 2143 IN v234881_v_d_rsc_0_30_q v234881_v_d_rsc_0_30_q 2144 IN v234881_v_d_rsc_0_31_q v234881_v_d_rsc_0_31_q} 
+   set o_candidates {2009 IN v234879_v_d_rsc_0_0_re v234879_v_d_rsc_0_0_re 2009 IN v234879_v_d_rsc_0_0_radr v234879_v_d_rsc_0_0_radr 2010 IN v234879_v_d_rsc_0_1_re v234879_v_d_rsc_0_1_re 2010 IN v234879_v_d_rsc_0_1_radr v234879_v_d_rsc_0_1_radr 2011 IN v234879_v_d_rsc_0_2_re v234879_v_d_rsc_0_2_re 2011 IN v234879_v_d_rsc_0_2_radr v234879_v_d_rsc_0_2_radr 2012 IN v234879_v_d_rsc_0_3_re v234879_v_d_rsc_0_3_re 2012 IN v234879_v_d_rsc_0_3_radr v234879_v_d_rsc_0_3_radr 2013 IN v234879_v_d_rsc_0_4_re v234879_v_d_rsc_0_4_re 2013 IN v234879_v_d_rsc_0_4_radr v234879_v_d_rsc_0_4_radr 2014 IN v234879_v_d_rsc_0_5_re v234879_v_d_rsc_0_5_re 2014 IN v234879_v_d_rsc_0_5_radr v234879_v_d_rsc_0_5_radr 2015 IN v234879_v_d_rsc_0_6_re v234879_v_d_rsc_0_6_re 2015 IN v234879_v_d_rsc_0_6_radr v234879_v_d_rsc_0_6_radr 2016 IN v234879_v_d_rsc_0_7_re v234879_v_d_rsc_0_7_re 2016 IN v234879_v_d_rsc_0_7_radr v234879_v_d_rsc_0_7_radr 2049 IN v234880_v_d_rsc_0_0_re v234880_v_d_rsc_0_0_re 2049 IN v234880_v_d_rsc_0_0_radr v234880_v_d_rsc_0_0_radr 2050 IN v234880_v_d_rsc_0_1_re v234880_v_d_rsc_0_1_re 2050 IN v234880_v_d_rsc_0_1_radr v234880_v_d_rsc_0_1_radr 2051 IN v234880_v_d_rsc_0_2_re v234880_v_d_rsc_0_2_re 2051 IN v234880_v_d_rsc_0_2_radr v234880_v_d_rsc_0_2_radr 2052 IN v234880_v_d_rsc_0_3_re v234880_v_d_rsc_0_3_re 2052 IN v234880_v_d_rsc_0_3_radr v234880_v_d_rsc_0_3_radr 2053 IN v234880_v_d_rsc_0_4_re v234880_v_d_rsc_0_4_re 2053 IN v234880_v_d_rsc_0_4_radr v234880_v_d_rsc_0_4_radr 2054 IN v234880_v_d_rsc_0_5_re v234880_v_d_rsc_0_5_re 2054 IN v234880_v_d_rsc_0_5_radr v234880_v_d_rsc_0_5_radr 2055 IN v234880_v_d_rsc_0_6_re v234880_v_d_rsc_0_6_re 2055 IN v234880_v_d_rsc_0_6_radr v234880_v_d_rsc_0_6_radr 2056 IN v234880_v_d_rsc_0_7_re v234880_v_d_rsc_0_7_re 2056 IN v234880_v_d_rsc_0_7_radr v234880_v_d_rsc_0_7_radr 2057 IN v234880_v_d_rsc_0_8_re v234880_v_d_rsc_0_8_re 2057 IN v234880_v_d_rsc_0_8_radr v234880_v_d_rsc_0_8_radr 2058 IN v234880_v_d_rsc_0_9_re v234880_v_d_rsc_0_9_re 2058 IN v234880_v_d_rsc_0_9_radr v234880_v_d_rsc_0_9_radr 2059 IN v234880_v_d_rsc_0_10_re v234880_v_d_rsc_0_10_re 2059 IN v234880_v_d_rsc_0_10_radr v234880_v_d_rsc_0_10_radr 2060 IN v234880_v_d_rsc_0_11_re v234880_v_d_rsc_0_11_re 2060 IN v234880_v_d_rsc_0_11_radr v234880_v_d_rsc_0_11_radr 2061 IN v234880_v_d_rsc_0_12_re v234880_v_d_rsc_0_12_re 2061 IN v234880_v_d_rsc_0_12_radr v234880_v_d_rsc_0_12_radr 2062 IN v234880_v_d_rsc_0_13_re v234880_v_d_rsc_0_13_re 2062 IN v234880_v_d_rsc_0_13_radr v234880_v_d_rsc_0_13_radr 2063 IN v234880_v_d_rsc_0_14_re v234880_v_d_rsc_0_14_re 2063 IN v234880_v_d_rsc_0_14_radr v234880_v_d_rsc_0_14_radr 2064 IN v234880_v_d_rsc_0_15_re v234880_v_d_rsc_0_15_re 2064 IN v234880_v_d_rsc_0_15_radr v234880_v_d_rsc_0_15_radr 2065 IN v234880_v_d_rsc_0_16_re v234880_v_d_rsc_0_16_re 2065 IN v234880_v_d_rsc_0_16_radr v234880_v_d_rsc_0_16_radr 2066 IN v234880_v_d_rsc_0_17_re v234880_v_d_rsc_0_17_re 2066 IN v234880_v_d_rsc_0_17_radr v234880_v_d_rsc_0_17_radr 2067 IN v234880_v_d_rsc_0_18_re v234880_v_d_rsc_0_18_re 2067 IN v234880_v_d_rsc_0_18_radr v234880_v_d_rsc_0_18_radr 2068 IN v234880_v_d_rsc_0_19_re v234880_v_d_rsc_0_19_re 2068 IN v234880_v_d_rsc_0_19_radr v234880_v_d_rsc_0_19_radr 2069 IN v234880_v_d_rsc_0_20_re v234880_v_d_rsc_0_20_re 2069 IN v234880_v_d_rsc_0_20_radr v234880_v_d_rsc_0_20_radr 2070 IN v234880_v_d_rsc_0_21_re v234880_v_d_rsc_0_21_re 2070 IN v234880_v_d_rsc_0_21_radr v234880_v_d_rsc_0_21_radr 2071 IN v234880_v_d_rsc_0_22_re v234880_v_d_rsc_0_22_re 2071 IN v234880_v_d_rsc_0_22_radr v234880_v_d_rsc_0_22_radr 2072 IN v234880_v_d_rsc_0_23_re v234880_v_d_rsc_0_23_re 2072 IN v234880_v_d_rsc_0_23_radr v234880_v_d_rsc_0_23_radr 2073 IN v234880_v_d_rsc_0_24_re v234880_v_d_rsc_0_24_re 2073 IN v234880_v_d_rsc_0_24_radr v234880_v_d_rsc_0_24_radr 2074 IN v234880_v_d_rsc_0_25_re v234880_v_d_rsc_0_25_re 2074 IN v234880_v_d_rsc_0_25_radr v234880_v_d_rsc_0_25_radr 2075 IN v234880_v_d_rsc_0_26_re v234880_v_d_rsc_0_26_re 2075 IN v234880_v_d_rsc_0_26_radr v234880_v_d_rsc_0_26_radr 2076 IN v234880_v_d_rsc_0_27_re v234880_v_d_rsc_0_27_re 2076 IN v234880_v_d_rsc_0_27_radr v234880_v_d_rsc_0_27_radr 2077 IN v234880_v_d_rsc_0_28_re v234880_v_d_rsc_0_28_re 2077 IN v234880_v_d_rsc_0_28_radr v234880_v_d_rsc_0_28_radr 2078 IN v234880_v_d_rsc_0_29_re v234880_v_d_rsc_0_29_re 2078 IN v234880_v_d_rsc_0_29_radr v234880_v_d_rsc_0_29_radr 2079 IN v234880_v_d_rsc_0_30_re v234880_v_d_rsc_0_30_re 2079 IN v234880_v_d_rsc_0_30_radr v234880_v_d_rsc_0_30_radr 2080 IN v234880_v_d_rsc_0_31_re v234880_v_d_rsc_0_31_re 2080 IN v234880_v_d_rsc_0_31_radr v234880_v_d_rsc_0_31_radr 2113 IN v234881_v_d_rsc_0_0_re v234881_v_d_rsc_0_0_re 2113 IN v234881_v_d_rsc_0_0_radr v234881_v_d_rsc_0_0_radr 2114 IN v234881_v_d_rsc_0_1_re v234881_v_d_rsc_0_1_re 2114 IN v234881_v_d_rsc_0_1_radr v234881_v_d_rsc_0_1_radr 2115 IN v234881_v_d_rsc_0_2_re v234881_v_d_rsc_0_2_re 2115 IN v234881_v_d_rsc_0_2_radr v234881_v_d_rsc_0_2_radr 2116 IN v234881_v_d_rsc_0_3_re v234881_v_d_rsc_0_3_re 2116 IN v234881_v_d_rsc_0_3_radr v234881_v_d_rsc_0_3_radr 2117 IN v234881_v_d_rsc_0_4_re v234881_v_d_rsc_0_4_re 2117 IN v234881_v_d_rsc_0_4_radr v234881_v_d_rsc_0_4_radr 2118 IN v234881_v_d_rsc_0_5_re v234881_v_d_rsc_0_5_re 2118 IN v234881_v_d_rsc_0_5_radr v234881_v_d_rsc_0_5_radr 2119 IN v234881_v_d_rsc_0_6_re v234881_v_d_rsc_0_6_re 2119 IN v234881_v_d_rsc_0_6_radr v234881_v_d_rsc_0_6_radr 2120 IN v234881_v_d_rsc_0_7_re v234881_v_d_rsc_0_7_re 2120 IN v234881_v_d_rsc_0_7_radr v234881_v_d_rsc_0_7_radr 2121 IN v234881_v_d_rsc_0_8_re v234881_v_d_rsc_0_8_re 2121 IN v234881_v_d_rsc_0_8_radr v234881_v_d_rsc_0_8_radr 2122 IN v234881_v_d_rsc_0_9_re v234881_v_d_rsc_0_9_re 2122 IN v234881_v_d_rsc_0_9_radr v234881_v_d_rsc_0_9_radr 2123 IN v234881_v_d_rsc_0_10_re v234881_v_d_rsc_0_10_re 2123 IN v234881_v_d_rsc_0_10_radr v234881_v_d_rsc_0_10_radr 2124 IN v234881_v_d_rsc_0_11_re v234881_v_d_rsc_0_11_re 2124 IN v234881_v_d_rsc_0_11_radr v234881_v_d_rsc_0_11_radr 2125 IN v234881_v_d_rsc_0_12_re v234881_v_d_rsc_0_12_re 2125 IN v234881_v_d_rsc_0_12_radr v234881_v_d_rsc_0_12_radr 2126 IN v234881_v_d_rsc_0_13_re v234881_v_d_rsc_0_13_re 2126 IN v234881_v_d_rsc_0_13_radr v234881_v_d_rsc_0_13_radr 2127 IN v234881_v_d_rsc_0_14_re v234881_v_d_rsc_0_14_re 2127 IN v234881_v_d_rsc_0_14_radr v234881_v_d_rsc_0_14_radr 2128 IN v234881_v_d_rsc_0_15_re v234881_v_d_rsc_0_15_re 2128 IN v234881_v_d_rsc_0_15_radr v234881_v_d_rsc_0_15_radr 2129 IN v234881_v_d_rsc_0_16_re v234881_v_d_rsc_0_16_re 2129 IN v234881_v_d_rsc_0_16_radr v234881_v_d_rsc_0_16_radr 2130 IN v234881_v_d_rsc_0_17_re v234881_v_d_rsc_0_17_re 2130 IN v234881_v_d_rsc_0_17_radr v234881_v_d_rsc_0_17_radr 2131 IN v234881_v_d_rsc_0_18_re v234881_v_d_rsc_0_18_re 2131 IN v234881_v_d_rsc_0_18_radr v234881_v_d_rsc_0_18_radr 2132 IN v234881_v_d_rsc_0_19_re v234881_v_d_rsc_0_19_re 2132 IN v234881_v_d_rsc_0_19_radr v234881_v_d_rsc_0_19_radr 2133 IN v234881_v_d_rsc_0_20_re v234881_v_d_rsc_0_20_re 2133 IN v234881_v_d_rsc_0_20_radr v234881_v_d_rsc_0_20_radr 2134 IN v234881_v_d_rsc_0_21_re v234881_v_d_rsc_0_21_re 2134 IN v234881_v_d_rsc_0_21_radr v234881_v_d_rsc_0_21_radr 2135 IN v234881_v_d_rsc_0_22_re v234881_v_d_rsc_0_22_re 2135 IN v234881_v_d_rsc_0_22_radr v234881_v_d_rsc_0_22_radr 2136 IN v234881_v_d_rsc_0_23_re v234881_v_d_rsc_0_23_re 2136 IN v234881_v_d_rsc_0_23_radr v234881_v_d_rsc_0_23_radr 2137 IN v234881_v_d_rsc_0_24_re v234881_v_d_rsc_0_24_re 2137 IN v234881_v_d_rsc_0_24_radr v234881_v_d_rsc_0_24_radr 2138 IN v234881_v_d_rsc_0_25_re v234881_v_d_rsc_0_25_re 2138 IN v234881_v_d_rsc_0_25_radr v234881_v_d_rsc_0_25_radr 2139 IN v234881_v_d_rsc_0_26_re v234881_v_d_rsc_0_26_re 2139 IN v234881_v_d_rsc_0_26_radr v234881_v_d_rsc_0_26_radr 2140 IN v234881_v_d_rsc_0_27_re v234881_v_d_rsc_0_27_re 2140 IN v234881_v_d_rsc_0_27_radr v234881_v_d_rsc_0_27_radr 2141 IN v234881_v_d_rsc_0_28_re v234881_v_d_rsc_0_28_re 2141 IN v234881_v_d_rsc_0_28_radr v234881_v_d_rsc_0_28_radr 2142 IN v234881_v_d_rsc_0_29_re v234881_v_d_rsc_0_29_re 2142 IN v234881_v_d_rsc_0_29_radr v234881_v_d_rsc_0_29_radr 2143 IN v234881_v_d_rsc_0_30_re v234881_v_d_rsc_0_30_re 2143 IN v234881_v_d_rsc_0_30_radr v234881_v_d_rsc_0_30_radr 2144 IN v234881_v_d_rsc_0_31_re v234881_v_d_rsc_0_31_re 2144 IN v234881_v_d_rsc_0_31_radr v234881_v_d_rsc_0_31_radr 2665 OUT v234882_v_d_rsc_0_0_we v234882_v_d_rsc_0_0_we 2665 OUT v234882_v_d_rsc_0_0_d v234882_v_d_rsc_0_0_d 2665 OUT v234882_v_d_rsc_0_0_wadr v234882_v_d_rsc_0_0_wadr 2666 OUT v234882_v_d_rsc_0_1_we v234882_v_d_rsc_0_1_we 2666 OUT v234882_v_d_rsc_0_1_d v234882_v_d_rsc_0_1_d 2666 OUT v234882_v_d_rsc_0_1_wadr v234882_v_d_rsc_0_1_wadr 2667 OUT v234882_v_d_rsc_0_2_we v234882_v_d_rsc_0_2_we 2667 OUT v234882_v_d_rsc_0_2_d v234882_v_d_rsc_0_2_d 2667 OUT v234882_v_d_rsc_0_2_wadr v234882_v_d_rsc_0_2_wadr 2668 OUT v234882_v_d_rsc_0_3_we v234882_v_d_rsc_0_3_we 2668 OUT v234882_v_d_rsc_0_3_d v234882_v_d_rsc_0_3_d 2668 OUT v234882_v_d_rsc_0_3_wadr v234882_v_d_rsc_0_3_wadr 2669 OUT v234882_v_d_rsc_0_4_we v234882_v_d_rsc_0_4_we 2669 OUT v234882_v_d_rsc_0_4_d v234882_v_d_rsc_0_4_d 2669 OUT v234882_v_d_rsc_0_4_wadr v234882_v_d_rsc_0_4_wadr 2670 OUT v234882_v_d_rsc_0_5_we v234882_v_d_rsc_0_5_we 2670 OUT v234882_v_d_rsc_0_5_d v234882_v_d_rsc_0_5_d 2670 OUT v234882_v_d_rsc_0_5_wadr v234882_v_d_rsc_0_5_wadr 2671 OUT v234882_v_d_rsc_0_6_we v234882_v_d_rsc_0_6_we 2671 OUT v234882_v_d_rsc_0_6_d v234882_v_d_rsc_0_6_d 2671 OUT v234882_v_d_rsc_0_6_wadr v234882_v_d_rsc_0_6_wadr 2672 OUT v234882_v_d_rsc_0_7_we v234882_v_d_rsc_0_7_we 2672 OUT v234882_v_d_rsc_0_7_d v234882_v_d_rsc_0_7_d 2672 OUT v234882_v_d_rsc_0_7_wadr v234882_v_d_rsc_0_7_wadr 2009 IN v234879_v_d_triosy_0_0_lz v234879_v_d_triosy_0_0_lz 2010 IN v234879_v_d_triosy_0_1_lz v234879_v_d_triosy_0_1_lz 2011 IN v234879_v_d_triosy_0_2_lz v234879_v_d_triosy_0_2_lz 2012 IN v234879_v_d_triosy_0_3_lz v234879_v_d_triosy_0_3_lz 2013 IN v234879_v_d_triosy_0_4_lz v234879_v_d_triosy_0_4_lz 2014 IN v234879_v_d_triosy_0_5_lz v234879_v_d_triosy_0_5_lz 2015 IN v234879_v_d_triosy_0_6_lz v234879_v_d_triosy_0_6_lz 2016 IN v234879_v_d_triosy_0_7_lz v234879_v_d_triosy_0_7_lz 2049 IN v234880_v_d_triosy_0_0_lz v234880_v_d_triosy_0_0_lz 2050 IN v234880_v_d_triosy_0_1_lz v234880_v_d_triosy_0_1_lz 2051 IN v234880_v_d_triosy_0_2_lz v234880_v_d_triosy_0_2_lz 2052 IN v234880_v_d_triosy_0_3_lz v234880_v_d_triosy_0_3_lz 2053 IN v234880_v_d_triosy_0_4_lz v234880_v_d_triosy_0_4_lz 2054 IN v234880_v_d_triosy_0_5_lz v234880_v_d_triosy_0_5_lz 2055 IN v234880_v_d_triosy_0_6_lz v234880_v_d_triosy_0_6_lz 2056 IN v234880_v_d_triosy_0_7_lz v234880_v_d_triosy_0_7_lz 2057 IN v234880_v_d_triosy_0_8_lz v234880_v_d_triosy_0_8_lz 2058 IN v234880_v_d_triosy_0_9_lz v234880_v_d_triosy_0_9_lz 2059 IN v234880_v_d_triosy_0_10_lz v234880_v_d_triosy_0_10_lz 2060 IN v234880_v_d_triosy_0_11_lz v234880_v_d_triosy_0_11_lz 2061 IN v234880_v_d_triosy_0_12_lz v234880_v_d_triosy_0_12_lz 2062 IN v234880_v_d_triosy_0_13_lz v234880_v_d_triosy_0_13_lz 2063 IN v234880_v_d_triosy_0_14_lz v234880_v_d_triosy_0_14_lz 2064 IN v234880_v_d_triosy_0_15_lz v234880_v_d_triosy_0_15_lz 2065 IN v234880_v_d_triosy_0_16_lz v234880_v_d_triosy_0_16_lz 2066 IN v234880_v_d_triosy_0_17_lz v234880_v_d_triosy_0_17_lz 2067 IN v234880_v_d_triosy_0_18_lz v234880_v_d_triosy_0_18_lz 2068 IN v234880_v_d_triosy_0_19_lz v234880_v_d_triosy_0_19_lz 2069 IN v234880_v_d_triosy_0_20_lz v234880_v_d_triosy_0_20_lz 2070 IN v234880_v_d_triosy_0_21_lz v234880_v_d_triosy_0_21_lz 2071 IN v234880_v_d_triosy_0_22_lz v234880_v_d_triosy_0_22_lz 2072 IN v234880_v_d_triosy_0_23_lz v234880_v_d_triosy_0_23_lz 2073 IN v234880_v_d_triosy_0_24_lz v234880_v_d_triosy_0_24_lz 2074 IN v234880_v_d_triosy_0_25_lz v234880_v_d_triosy_0_25_lz 2075 IN v234880_v_d_triosy_0_26_lz v234880_v_d_triosy_0_26_lz 2076 IN v234880_v_d_triosy_0_27_lz v234880_v_d_triosy_0_27_lz 2077 IN v234880_v_d_triosy_0_28_lz v234880_v_d_triosy_0_28_lz 2078 IN v234880_v_d_triosy_0_29_lz v234880_v_d_triosy_0_29_lz 2079 IN v234880_v_d_triosy_0_30_lz v234880_v_d_triosy_0_30_lz 2080 IN v234880_v_d_triosy_0_31_lz v234880_v_d_triosy_0_31_lz 2113 IN v234881_v_d_triosy_0_0_lz v234881_v_d_triosy_0_0_lz 2114 IN v234881_v_d_triosy_0_1_lz v234881_v_d_triosy_0_1_lz 2115 IN v234881_v_d_triosy_0_2_lz v234881_v_d_triosy_0_2_lz 2116 IN v234881_v_d_triosy_0_3_lz v234881_v_d_triosy_0_3_lz 2117 IN v234881_v_d_triosy_0_4_lz v234881_v_d_triosy_0_4_lz 2118 IN v234881_v_d_triosy_0_5_lz v234881_v_d_triosy_0_5_lz 2119 IN v234881_v_d_triosy_0_6_lz v234881_v_d_triosy_0_6_lz 2120 IN v234881_v_d_triosy_0_7_lz v234881_v_d_triosy_0_7_lz 2121 IN v234881_v_d_triosy_0_8_lz v234881_v_d_triosy_0_8_lz 2122 IN v234881_v_d_triosy_0_9_lz v234881_v_d_triosy_0_9_lz 2123 IN v234881_v_d_triosy_0_10_lz v234881_v_d_triosy_0_10_lz 2124 IN v234881_v_d_triosy_0_11_lz v234881_v_d_triosy_0_11_lz 2125 IN v234881_v_d_triosy_0_12_lz v234881_v_d_triosy_0_12_lz 2126 IN v234881_v_d_triosy_0_13_lz v234881_v_d_triosy_0_13_lz 2127 IN v234881_v_d_triosy_0_14_lz v234881_v_d_triosy_0_14_lz 2128 IN v234881_v_d_triosy_0_15_lz v234881_v_d_triosy_0_15_lz 2129 IN v234881_v_d_triosy_0_16_lz v234881_v_d_triosy_0_16_lz 2130 IN v234881_v_d_triosy_0_17_lz v234881_v_d_triosy_0_17_lz 2131 IN v234881_v_d_triosy_0_18_lz v234881_v_d_triosy_0_18_lz 2132 IN v234881_v_d_triosy_0_19_lz v234881_v_d_triosy_0_19_lz 2133 IN v234881_v_d_triosy_0_20_lz v234881_v_d_triosy_0_20_lz 2134 IN v234881_v_d_triosy_0_21_lz v234881_v_d_triosy_0_21_lz 2135 IN v234881_v_d_triosy_0_22_lz v234881_v_d_triosy_0_22_lz 2136 IN v234881_v_d_triosy_0_23_lz v234881_v_d_triosy_0_23_lz 2137 IN v234881_v_d_triosy_0_24_lz v234881_v_d_triosy_0_24_lz 2138 IN v234881_v_d_triosy_0_25_lz v234881_v_d_triosy_0_25_lz 2139 IN v234881_v_d_triosy_0_26_lz v234881_v_d_triosy_0_26_lz 2140 IN v234881_v_d_triosy_0_27_lz v234881_v_d_triosy_0_27_lz 2141 IN v234881_v_d_triosy_0_28_lz v234881_v_d_triosy_0_28_lz 2142 IN v234881_v_d_triosy_0_29_lz v234881_v_d_triosy_0_29_lz 2143 IN v234881_v_d_triosy_0_30_lz v234881_v_d_triosy_0_30_lz 2144 IN v234881_v_d_triosy_0_31_lz v234881_v_d_triosy_0_31_lz 2665 OUT v234882_v_d_triosy_0_0_lz v234882_v_d_triosy_0_0_lz 2666 OUT v234882_v_d_triosy_0_1_lz v234882_v_d_triosy_0_1_lz 2667 OUT v234882_v_d_triosy_0_2_lz v234882_v_d_triosy_0_2_lz 2668 OUT v234882_v_d_triosy_0_3_lz v234882_v_d_triosy_0_3_lz 2669 OUT v234882_v_d_triosy_0_4_lz v234882_v_d_triosy_0_4_lz 2670 OUT v234882_v_d_triosy_0_5_lz v234882_v_d_triosy_0_5_lz 2671 OUT v234882_v_d_triosy_0_6_lz v234882_v_d_triosy_0_6_lz 2672 OUT v234882_v_d_triosy_0_7_lz v234882_v_d_triosy_0_7_lz} 
+   foreach { orsid orsmode iclk ote } $clk_candidates {
+   puts "Timing reporting for orsid=$orsid orsmode=$orsmode iclk=$iclk ote=$ote "
+      foreach { irsid irsmode iport ite } $i_candidates {
+         if { [llength [get_clocks -quiet $iclk] ] > 0 && [llength [all_registers -clock $iclk ] ] > 0 } {
+            puts "-- Synthesis input_to_register:timing report for design 'top' '${irsid}' '${irsmode}' port '${ite}' '${orsid}' '${orsmode}' CLOCK '${ote}'"
+            report_timing -nosplit -significant_digits 4 -capacitance -from ${iport} -to [all_registers -data_pins -clock $iclk ] 
+            puts "-- END Synthesis input_to_register:timing report for design 'top' '${irsid}' '${irsmode}' port '${ite}' '${orsid}' '${orsmode}' CLOCK '${ote}'"
+         }
+      }
+   }
+   foreach { orsid orsmode oclk ote } $clk_candidates {
+      foreach { irsid irsmode iclk ite } $clk_candidates {
+         if { [llength [get_clocks -quiet ${iclk}] ] > 0 && [llength [get_clocks -quiet ${oclk}] ] > 0 && [llength [all_registers -clock ${iclk}] ] > 0 && [llength [all_registers -clock ${oclk}] ] > 0 } {
+            puts "-- Synthesis register_to_register:timing report for design 'top' '${irsid}' '${irsmode}' CLOCK '${ite}' '${orsid}' '${orsmode}' CLOCK '${ote}'"
+            report_timing -nosplit -significant_digits 4 -capacitance -from [all_registers -clock_pins -clock ${iclk}] -to [all_registers -data_pins -clock ${oclk}] 
+            puts "-- END Synthesis register_to_register:timing report for design 'top' '${irsid}' '${irsmode}' CLOCK '${ite}' '${orsid}' '${orsmode}' CLOCK '${ote}'"
+         }
+      }
+   }
+   foreach { orsid orsmode oport ote } $o_candidates {
+      foreach { irsid irsmode iclk ite } $clk_candidates {
+         if { [llength [get_clocks -quiet ${iclk}] ] > 0 && [llength [all_registers -clock ${iclk}] ] > 0 } {
+            puts "-- Synthesis register_to_output:timing report for design 'top' '${irsid}' '${irsmode}' CLOCK '${ite}' '${orsid}' '${orsmode}' port '${ote}'"
+            report_timing -nosplit -significant_digits 4 -capacitance -from [all_registers -clock_pins -clock ${iclk}] -to ${oport}
+            puts "-- END Synthesis register_to_output:timing report for design 'top' '${irsid}' '${irsmode}' CLOCK '${ite}' '${orsid}' '${orsmode}' port '${ote}'"
+         }
+      }
+   }
+   foreach { orsid orsmode oport ote } $o_candidates {
+      foreach { irsid irsmode iport ite } $i_candidates {
+         puts "-- Synthesis input_to_output:timing report for design 'top' '${irsid}' '${irsmode}' port '${ite}' '${orsid}' '${orsmode}' port '${ote}'"
+         report_timing -nosplit -significant_digits 4 -capacitance -from ${iport} -to ${oport}
+         puts "-- END Synthesis input_to_output:timing report for design 'top' '${irsid}' '${irsmode}' port '${ite}' '${orsid}' '${orsmode}' port '${ote}'"
+      }
+   }
+} else {
+   puts "Timing reporting turned off in the script "
+}
+if {$hls_status} {
+  puts "Warning: Check transcript for errors hls_status=$hls_status"
+}
+puts "[clock format [clock seconds] -format {%a %b %d %H:%M:%S %Z %Y}]"
+set dc_bin_fmt ddc
+if { [lindex [split $compatibility_version "-"] 1] < "2006.06" } {
+    set dc_bin_fmt db
+}
+write -hierarchy -format $dc_bin_fmt -output gate.dc.v.$dc_bin_fmt
+change_names -hierarchy -rules vhdl
+write -hierarchy -format vhdl -output /scratch/ry375/attn_asic/runs/dep_cw8/Catapult/top.v1/./gate.dc.v.vhdl
+write_sdc /scratch/ry375/attn_asic/runs/dep_cw8/Catapult/top.v1/./gate.dc.v.sdc
+write_sdf /scratch/ry375/attn_asic/runs/dep_cw8/Catapult/top.v1/./gate.dc.v.sdf
+# Source potential custom script
+source_custom_script final
+
+cd ..
+
+puts "-- Synthesis finished for design 'top'"
+
+puts "-- Final RTL-to-Gate synthesis complete for 'top'"
+
+# Source potential custom script
+source_custom_script terminate
+
